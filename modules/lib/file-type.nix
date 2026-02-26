@@ -138,6 +138,49 @@ in
                 link.
               '';
             };
+
+            mutable = mkOption {
+              type = types.submodule {
+                options = {
+                  enable = mkOption {
+                    type = types.bool;
+                    default = false;
+                    description = ''
+                      Whether this file should be mutable. When enabled, the file
+                      will not be a direct symlink to the Nix store but a writable
+                      working copy under {var}`home.mutableDirectory`.
+
+                      The immutable seed file from the Nix store is used as the
+                      initial source; whether user edits are preserved depends on
+                      {var}`mutable.mode`.
+                    '';
+                  };
+
+                  mode = mkOption {
+                    type = types.enum [
+                      "seed"
+                      "force"
+                    ];
+                    default = "force";
+                    description = ''
+                      How the mutable file should be managed:
+
+                      - `seed`: The working copy is created once per store path
+                        and never updated. User modifications persist.
+
+                      - `force`: The working copy is created per store path and
+                        re-seeded on every switch for the current generation.
+                        Different generations produce different copies and
+                        rollback repoints to the previous generation's copy.
+                    '';
+                  };
+                };
+              };
+              default = { };
+              description = ''
+                Options for making this file mutable.
+              '';
+            };
           };
 
           config = {

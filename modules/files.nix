@@ -9,6 +9,8 @@ let
 
   cfg = lib.filterAttrs (n: f: f.enable) config.home.file;
 
+  mutableFiles = lib.filterAttrs (n: f: f.mutable.enable) cfg;
+
   homeDirectory = config.home.homeDirectory;
 
   fileType =
@@ -38,6 +40,23 @@ in
       description = "Attribute set of files to link into the user home.";
       default = { };
       type = fileType "home.file" "{env}`HOME`" homeDirectory;
+    };
+
+    home.mutableDirectory = lib.mkOption {
+      type = with lib.types; coercedTo path toString str;
+      default = "${config.home.homeDirectory}/.home-manager/mutable";
+      defaultText = lib.literalExpression ''"''${config.home.homeDirectory}/.home-manager/mutable"'';
+      description = ''
+        Directory where mutable file working copies are stored.
+
+        Each mutable file gets its own subdirectory based on its store path,
+        allowing generation-aware tracking and rollback support.
+
+        You can change this to store mutable files elsewhere, for example:
+        - `"''${config.home.homeDirectory}/.local/state/hm-mutable"`
+        - `"''${config.xdg.stateHome}/home-manager/mutable"`
+      '';
+      example = lib.literalExpression ''"''${config.xdg.stateHome}/home-manager/mutable"'';
     };
 
     home-files = lib.mkOption {
@@ -124,6 +143,8 @@ in
     #    generation.
     #
     # 2. Symlink files from the new generation into $HOME.
+    #    - For mutable files: create working copies and symlink to them
+    #    - For immutable files: direct symlink to store
     #
     # This order is needed to ensure that we always know which links
     # belong to which generation. Specifically, if we're moving from
@@ -172,6 +193,87 @@ in
           done
         '';
 
+        mutableExactInit = lib.concatMapStringsSep "\n" (
+          v: "mutableExact[${lib.escapeShellArg v.target}]=${lib.escapeShellArg v.mutable.mode}"
+        ) (lib.filter (v: !v.recursive) (lib.attrValues mutableFiles));
+
+        mutablePrefixInit = lib.concatMapStringsSep "\n" (
+          v: "mutablePrefixes[${lib.escapeShellArg v.target}]=${lib.escapeShellArg v.mutable.mode}"
+        ) (lib.filter (v: v.recursive) (lib.attrValues mutableFiles));
+
+        linkMutable = pkgs.writeShellScript "link-mutable" ''
+          ${config.lib.bash.initHomeManagerLib}
+
+          # Called via:
+          #   find "$newGenFiles" ... -printf '%P\0' | xargs -0 bash THIS "$newGenFiles"
+          #
+          # For each relative path in the mutable set, replace the store symlink
+          # in $HOME with one pointing at a writable working copy under mutableDir.
+          # The working copy is keyed by the store path of the seed file to keep
+          # generation-aware rollback behavior.
+
+          newGenFiles="$1"
+          shift
+          mutableDir=${lib.escapeShellArg config.home.mutableDirectory}
+
+          declare -A mutableExact
+          declare -A mutablePrefixes
+          ${mutableExactInit}
+          ${mutablePrefixInit}
+
+          for relativePath in "$@"; do
+            mode=""
+            if [[ -n "''${mutableExact[$relativePath]+x}" ]]; then
+              mode="''${mutableExact[$relativePath]}"
+            else
+              bestPrefix=""
+              bestLen=0
+              for prefix in "''${!mutablePrefixes[@]}"; do
+                if [[ "$relativePath" == "$prefix/"* ]]; then
+                  if (( ''${#prefix} > bestLen )); then
+                    bestPrefix="$prefix"
+                    bestLen=''${#prefix}
+                  fi
+                fi
+              done
+
+              if [[ -n "$bestPrefix" ]]; then
+                mode="''${mutablePrefixes[$bestPrefix]}"
+              else
+                continue
+              fi
+            fi
+
+            seedPath="$newGenFiles/$relativePath"
+            storeBase="$(basename "$newGenFiles")"
+            workingCopy="$mutableDir/store/$storeBase/$relativePath"
+            targetPath="$HOME/$relativePath"
+
+            mode="''${mode:-force}"
+
+            if [[ "$mode" == "force" && -e "$workingCopy" ]]; then
+              verboseEcho "Refreshing mutable working copy (force): $workingCopy"
+              run rm -rf $VERBOSE_ARG "$workingCopy"
+            fi
+
+            if [[ ! -e "$workingCopy" ]]; then
+              verboseEcho "Seeding mutable working copy: $workingCopy"
+              run mkdir -p $VERBOSE_ARG "$(dirname "$workingCopy")"
+              if [[ -d "$seedPath" ]]; then
+                run cp -r $VERBOSE_ARG "$seedPath" "$workingCopy"
+              else
+                run cp $VERBOSE_ARG "$seedPath" "$workingCopy"
+              fi
+              run chmod -R u+w "$workingCopy"
+            else
+              verboseEcho "Keeping existing mutable working copy: $workingCopy"
+            fi
+
+            run mkdir -p $VERBOSE_ARG "$(dirname "$targetPath")"
+            run ln -Tsf $VERBOSE_ARG "$workingCopy" "$targetPath" || exit 1
+          done
+        '';
+
         cleanup = pkgs.writeShellScript "cleanup" ''
           ${config.lib.bash.initHomeManagerLib}
 
@@ -215,8 +317,15 @@ in
 
           local newGenFiles
           newGenFiles="$(readlink -e "$newGenPath/home-files")"
+
+          # Symlink all files from the store into $HOME.
           find "$newGenFiles" \( -type f -or -type l \) \
             -exec bash ${link} "$newGenFiles" {} +
+
+          # For mutable files, replace the store symlink with one pointing at
+          # a writable working copy (seeded from home-manager-files on first use).
+          find "$newGenFiles" \( -type f -or -type l \) -printf '%P\0' \
+            | xargs -0 bash ${linkMutable} "$newGenFiles"
         }
 
         function cleanOldGen() {
